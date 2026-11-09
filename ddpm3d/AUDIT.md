@@ -49,13 +49,21 @@ The ancestral sampler stops after one step, and the data path feeds 1-channel
 
 ## What `ddpm3d/` does instead
 
-| Item | Choice |
-| --- | --- |
-| Network | 3D U-Net, base 64 channels, multipliers (1, 2, 2, 4), 2 residual blocks per level, GroupNorm + SiLU pre-activation, time injected by adaptive group-norm scale/shift, zero-initialised residual and output layers, multi-head attention at 16³ and 8³ (`scaled_dot_product_attention`), dropout 0.1. 49.4 M parameters. |
-| Diffusion | T = 1,000, linear β 1e-4 → 0.02 (cosine available), ε-prediction, L_simple loss (mean over all elements). |
-| Sampling | DDPM: all 1,000 steps, posterior variance, x0 clipped each step. DDIM: η = 0, evenly spaced training timesteps from noisy to clean, same schedule as training, x0 clipped. A test checks that DDIM with all steps and η = 1 equals DDPM. |
-| Data | All volumes loaded once onto the GPU as class indices. Values detected from the data (≤ 16 labels). Binary → one channel at ±1; more phases → one-hot. Random flips along x, y and z; axis permutations optional (off: some materials are anisotropic). |
-| Optimisation | AdamW, lr 1e-4, 1,000-step linear warm-up then constant, batch 8, gradient clip 1, EMA 0.9999 with warm-up, bf16 autocast, TF32. 150,000 iterations by default. |
-| Checkpoints | `last.pt` every 2,000 steps (model, EMA, optimiser, RNG). EMA snapshot every 10,000 steps, plus a DDIM-50 preview PNG. Resume is bit-exact (tested). SIGUSR1/SIGTERM → save and exit 99 for requeue. |
-| Selection | Every EMA snapshot scored on 32 DDIM-50 samples against 256 training volumes: phase-fraction W1 + error of the mean two-point function along x, y and z. The same criterion is used for WGAN-GP. |
-| Outputs | Per sampler: 150 volumes in the original label values, raw float16 output, and `timing.json` with network evaluations and generation-only wall time. |
+The defaults follow current diffusion practice, not the original paper's configuration.
+
+| Item | Choice | Why |
+| --- | --- | --- |
+| Noise schedule | Cosine in logSNR, shifted by log(1/8) | A 64³ volume has as many elements as a 512² image, so averaging over voxels strips noise from coarse structure and the standard schedule barely trains the high-noise regime. The shift (Hoogeboom et al. 2023, "simple diffusion") gives the 8³ bottleneck the SNR a 64² image's 8² bottleneck would see. |
+| Terminal SNR | Zero (alpha_bar_T = 0) | Training then sees the pure noise that sampling starts from (Lin et al. 2024). |
+| Prediction target | v = sqrt(ab)·eps − sqrt(1−ab)·x0 | Defined at zero SNR (eps-prediction is not) and stable at high noise (Salimans & Ho 2022). Loss: plain MSE on v. |
+| Self-conditioning | On (p = 0.5 during training; previous x0 estimate at sampling) | The Analog Bits recipe for discrete data diffused as ±1 values (Chen, Zhang & Hinton 2023), which is what segmented volumes are. Costs about 25% more training compute. |
+| Network | 3D U-Net, base 64, multipliers (1, 2, 4, 4), 2 residual blocks per level (per-level counts allowed), GroupNorm + SiLU, adaptive scale/shift time conditioning, zero-initialised residual and output layers, dropout 0.1, attention at 16³ and 8³ with QK RMS-norm, `scaled_dot_product_attention`. 70.9 M parameters. | Extra width goes to 16³/8³, where coarse 3D structure forms and convolutions are cheap. The 64³ level, which dominates compute, keeps 64 channels. QK-norm prevents attention-logit blow-up in bf16. |
+| Optimiser | AdamW, lr 1e-4, betas (0.9, 0.99), no weight decay, 1k-step warm-up then constant, gradient clip 1 | Standard for diffusion U-Nets; beta2 = 0.99 adapts faster to the shifting loss scale across noise levels. |
+| Batch and length | 16 volumes × 100k iterations (1.6 M samples seen, with random flips) | Check `gpu_mem_gb` and `it_per_s` in the first minutes; adjust via `TRAIN_ARGS`. |
+| Weight averaging | Two EMAs (0.999 and 0.9999), both snapshotted every 10k steps | Which decay works best depends on run length; the selection step picks it instead of guessing. |
+| Speed | bf16 autocast, TF32, channels-last-3d, `torch.compile` (falls back to eager on error), whole dataset on the GPU | |
+| Samplers | DDPM (1,000 steps, posterior variance), DDIM (η = 0, 50 and 100 steps), DPM-Solver++(2M) (20 steps; Lu et al. 2022). All use the training schedule, run noisy → clean, clip x0 each step, and pass the self-conditioning estimate. | DPM-Solver++ is the standard accelerated sampler for this model class; it answers the reviewer's request for accelerated DDPM sampling. |
+| Checks | 17 tests, including: every sampler recovers a point mass exactly given the exact denoiser; DDIM with all steps and η = 1 equals DDPM; the schedule shift is exactly log(1/8); resume is bit-exact. | |
+| Selection | Every EMA snapshot from step 30k on: 32 DDIM-50 samples vs 256 training volumes, phase-fraction W1 + mean two-point-function error along x, y, z. Same criterion as WGAN-GP. | |
+
+Not adopted, deliberately: EDM-style continuous-time preconditioning and transformer backbones (DiT/U-ViT). The first would no longer be a DDPM in the benchmark's sense; the second is data-hungry and expensive at 64³ in pixel space with ~2,500 training volumes.

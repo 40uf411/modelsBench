@@ -3,7 +3,7 @@ Pick the best EMA snapshot with a stated criterion.
 
     python -m ddpm3d.select --run_dir RUN [--sampler ddim --steps 50]
 
-Each RUN/snapshots/ema_XXXXXXX.pt generates --n_eval volumes (fixed seed)
+Each RUN/snapshots/ema<decay>_<step>.pt (all EMA decays) generates --n_eval volumes (fixed seed)
 and is scored against --n_ref training volumes with metrics.score_population
 (phase-fraction Wasserstein-1 + error of the mean two-point function along
 x, y, z); the same criterion is used for WGAN-GP. Selection samples with
@@ -19,6 +19,7 @@ import csv
 import glob
 import json
 import os
+import re
 import shutil
 import sys
 
@@ -64,8 +65,9 @@ def generate_labels(model, diffusion, codec, shape, n, batch, device, sampler, s
 def main(argv=None) -> int:
     args = parse_args(argv)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    snaps = sorted(glob.glob(os.path.join(args.run_dir, "snapshots", "ema_*.pt")))
-    snaps = [s for s in snaps if int(os.path.basename(s)[4:11]) >= args.min_step]
+    snaps = sorted(glob.glob(os.path.join(args.run_dir, "snapshots", "ema*.pt")))
+    step_of = lambda p: int(re.search(r"_(\d+)\.pt$", os.path.basename(p)).group(1))
+    snaps = [s for s in snaps if step_of(s) >= args.min_step]
     if not snaps:
         print("no snapshots found", file=sys.stderr)
         return 1
@@ -88,14 +90,14 @@ def main(argv=None) -> int:
         lab = generate_labels(model, diffusion, codec, shape, args.n_eval, args.batch, device,
                               args.sampler, min(args.steps, diffusion.T), args.seed, bool(args.bf16))
         sc = score_population(lab, ref)
-        sc.update({"step": ck["step"], "snapshot": os.path.basename(path)})
+        sc.update({"step": ck["step"], "ema_decay": ck.get("ema_decay"), "snapshot": os.path.basename(path)})
         rows.append(sc)
-        print(f"step {ck['step']:7d}  score {sc['score']:.4f}  frac {sc['frac_w1_norm']:.4f}  "
+        print(f"step {ck['step']:7d}  ema {ck.get('ema_decay')}  score {sc['score']:.4f}  frac {sc['frac_w1_norm']:.4f}  "
               f"s2 {sc['s2_rel_l2']:.4f}", flush=True)
 
     out = os.path.join(args.run_dir, "selection")
     os.makedirs(out, exist_ok=True)
-    keys = ["step", "snapshot", "score", "frac_w1_norm", "s2_rel_l2"] + \
+    keys = ["step", "ema_decay", "snapshot", "score", "frac_w1_norm", "s2_rel_l2"] + \
         sorted(x for x in rows[0] if x.startswith("frac") and x != "frac_w1_norm")
     with open(os.path.join(out, "scores.csv"), "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=keys, extrasaction="ignore")

@@ -11,20 +11,20 @@ with the previous code and what changed.
     sbatch slurm/train_ddpm_3d.slurm illite_bin   # selected datasets only
 
 For each dataset the job trains, selects the best EMA snapshot, and then
-generates 150 samples with DDPM (1,000 steps) and with DDIM (50 and 100 steps,
-`DDIM_STEPS`). Near the time limit, training saves its state and the job
+generates 150 samples each with DDPM (1,000 steps), DDIM (50 and 100 steps,
+`DDIM_STEPS`) and DPM-Solver++(2M) (20 steps, `DPMPP_STEPS`). Near the time limit, training saves its state and the job
 requeues itself; finished stages are skipped on restart.
 
 Per-dataset outputs (`$GLOBALSCRATCH/modelsbench/ddpm_3d/<dataset>/`):
 
     config.json                    all settings, data values, parameter count
     train_log.csv                  loss, lr, gradient norm, it/s, GPU memory
-    snapshots/ema_XXXXXXX.pt       EMA weights every 10,000 steps
+    snapshots/ema<decay>_<step>.pt EMA weights (0.999 and 0.9999) every 10,000 steps
     previews/step_XXXXXXX.png      central slices of 4 DDIM-50 samples
     selection/scores.csv, best.json
     best.pt                        selected snapshot
     samples/ddpm/labels/sample_XXX.npy
-    samples/ddim50/..., samples/ddim100/...
+    samples/ddim50/..., samples/ddim100/..., samples/dpmpp20/...
     samples/*/raw/samples_raw.npy  output before discretisation (float16)
     samples/*/timing.json          network evaluations, generation time, GPU
 
@@ -49,8 +49,14 @@ one-hot encoded (`--encoding` overrides this). Random flips along x, y and z
 are on by default. Axis permutations (`--permute_axes 1`) are off, because some
 of the materials are anisotropic.
 
-## Defaults and expected cost
+## Defaults
 
-49.4 M parameters, batch 8, bf16. GPU time per dataset is not measured yet;
-check `it/s` in `train_log.csv` after the first minutes and adjust `--iters`
+v-prediction, shifted-cosine schedule (SNR × 1/8) with zero terminal SNR,
+self-conditioning, U-Net 64 × (1, 2, 4, 4) with QK-normalised attention at
+16³ and 8³ (70.9 M parameters), AdamW lr 1e-4, batch 16, 100k iterations,
+EMAs 0.999 and 0.9999, bf16, `torch.compile`. `AUDIT.md` gives the reasoning
+and references.
+
+GPU time per dataset is not measured yet. Check `it_per_s` and `gpu_mem_gb`
+in `train_log.csv` after the first minutes; change `--batch_size` or `--iters`
 through `TRAIN_ARGS` if needed.

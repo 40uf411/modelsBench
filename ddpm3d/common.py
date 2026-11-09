@@ -8,7 +8,7 @@ from typing import Dict
 import torch
 
 from .data import PhaseCodec
-from .diffusion import GaussianDiffusion, make_betas
+from .diffusion import GaussianDiffusion, make_alphas_cumprod
 from .unet import UNet3D
 
 
@@ -48,9 +48,12 @@ def build_model(cfg: Dict) -> UNet3D:
 
 
 def build_diffusion(dcfg: Dict) -> GaussianDiffusion:
-    return GaussianDiffusion(make_betas(dcfg["schedule"], dcfg["T"]),
+    ab = make_alphas_cumprod(dcfg["schedule"], dcfg["T"], dcfg.get("snr_scale", 1.0),
+                             dcfg.get("zero_terminal_snr", False))
+    return GaussianDiffusion(ab, prediction=dcfg.get("prediction", "eps"),
                              var_type=dcfg.get("var_type", "fixedsmall"),
-                             clip_x0=dcfg.get("clip_x0", True))
+                             clip_x0=dcfg.get("clip_x0", True),
+                             self_condition=dcfg.get("self_condition", False))
 
 
 def atomic_save(obj, path: str):

@@ -3,6 +3,7 @@ Generate evaluation samples from a DDPM snapshot.
 
     python -m ddpm3d.sample --ckpt RUN/best.pt --out_dir RUN/samples/ddpm --sampler ddpm
     python -m ddpm3d.sample --ckpt RUN/best.pt --out_dir RUN/samples/ddim50 --sampler ddim --steps 50
+    python -m ddpm3d.sample --ckpt RUN/best.pt --out_dir RUN/samples/dpmpp20 --sampler dpmpp --steps 20
 
 Writes to out_dir/
   labels/sample_XXX.npy   one volume per file, in the original data values
@@ -31,8 +32,8 @@ def parse_args(argv=None):
     p.add_argument("--ckpt", required=True)
     p.add_argument("--out_dir", required=True)
     p.add_argument("--n", type=int, default=150)
-    p.add_argument("--sampler", default="ddpm", choices=["ddpm", "ddim"])
-    p.add_argument("--steps", type=int, default=50, help="DDIM steps (ignored for ddpm)")
+    p.add_argument("--sampler", default="ddpm", choices=["ddpm", "ddim", "dpmpp"])
+    p.add_argument("--steps", type=int, default=50, help="DDIM / DPM-Solver++ steps (ignored for ddpm)")
     p.add_argument("--eta", type=float, default=0.0, help="DDIM eta")
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--seed", type=int, default=2024)
@@ -74,9 +75,12 @@ def main(argv=None) -> int:
         with autocast(device, bool(args.bf16)):
             if args.sampler == "ddpm":
                 x = diffusion.ddpm_sample(model, (b, codec.channels, *shape), device, generator=g, progress=True)
-            else:
+            elif args.sampler == "ddim":
                 x = diffusion.ddim_sample(model, (b, codec.channels, *shape), device, steps=args.steps,
                                           eta=args.eta, generator=g, progress=True)
+            else:
+                x = diffusion.dpmpp_sample(model, (b, codec.channels, *shape), device, steps=args.steps,
+                                           generator=g, progress=True)
         if device.type == "cuda":
             torch.cuda.synchronize()
         gen_seconds += time.time() - t0
@@ -97,6 +101,7 @@ def main(argv=None) -> int:
             "sampler": args.sampler,
             "steps": nfe,
             "eta": args.eta if args.sampler == "ddim" else None,
+            "snapshot_ema_decay": ck.get("ema_decay"),
             "network_evaluations_per_sample": nfe,
             "n_samples": args.n,
             "batch": args.batch,

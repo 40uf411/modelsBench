@@ -4,15 +4,24 @@ Train a 3D DDPM on a folder of segmented .npy volumes.
     python -m ddpm3d.train --data_dir DATA --out_dir RUN [options]
 
 Writes to RUN/
-  last.pt                     model, EMA, optimiser, step, RNG state (resume)
-  snapshots/ema_XXXXXXX.pt    EMA weights + configs every --snapshot_every steps
-  previews/step_XXXXXXX.png   central slices of 4 DDIM-50 samples (EMA)
-  train_log.csv               step, loss, lr, grad norm, throughput
+  last.pt                              model, EMAs, optimiser, step, RNG state (resume)
+  snapshots/ema<decay>_<step>.pt       EMA weights + configs every --snapshot_every steps,
+                                       one file per EMA decay
+  previews/step_XXXXXXX.png            central slices of 4 DDIM-50 samples (slowest EMA)
+  train_log.csv                        step, loss, lr, grad norm, throughput, memory
   config.json
-  TRAINING_DONE               when --iters is reached
+  TRAINING_DONE                        when --iters is reached
 
-Resumes automatically from RUN/last.pt. On SIGUSR1 or SIGTERM it saves
-last.pt and exits with code 99 (the Slurm script requeues the job).
+Resumes from RUN/last.pt. On SIGUSR1 or SIGTERM it saves last.pt and exits
+with code 99 (the Slurm script requeues the job).
+
+Defaults (see diffusion.py and unet.py for the reasoning):
+  v-prediction, shifted-cosine schedule (SNR x 1/8) with zero terminal SNR,
+  self-conditioning, U-Net 64 x (1, 2, 4, 4) with attention at 16^3 and 8^3,
+  AdamW (lr 1e-4, betas 0.9/0.99), 1k warm-up then constant, batch 16,
+  gradient clip 1, two EMAs (0.999 and 0.9999; the selection step picks the
+  better one), bf16 autocast, channels-last-3d layout, torch.compile with an
+  automatic fallback to eager mode.
 """
 from __future__ import annotations
 
@@ -52,25 +61,32 @@ def parse_args(argv=None):
     p.add_argument("--max_files", type=int, default=None, help="debug: use only the first N volumes")
     # model
     p.add_argument("--base_channels", type=int, default=64)
-    p.add_argument("--channel_mult", default="1,2,2,4")
-    p.add_argument("--num_res_blocks", type=int, default=2)
+    p.add_argument("--channel_mult", default="1,2,4,4")
+    p.add_argument("--num_res_blocks", default="2", help="one value, or one per level (e.g. 2,2,3,3)")
     p.add_argument("--attention_resolutions", default="16,8")
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--head_channels", type=int, default=64)
+    p.add_argument("--self_condition", type=int, default=1)
     # diffusion
     p.add_argument("--T", type=int, default=1000)
-    p.add_argument("--schedule", default="linear", choices=["linear", "cosine"])
+    p.add_argument("--schedule", default="cosine", choices=["cosine", "linear"])
+    p.add_argument("--snr_scale", type=float, default=0.125,
+                   help="multiplies the SNR of every step (shifted schedule); 1 = unshifted")
+    p.add_argument("--zero_terminal_snr", type=int, default=1)
+    p.add_argument("--prediction", default="v", choices=["v", "eps"])
     p.add_argument("--var_type", default="fixedsmall", choices=["fixedsmall", "fixedlarge"])
     # optimisation
-    p.add_argument("--iters", type=int, default=150_000)
-    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--iters", type=int, default=100_000)
+    p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--warmup", type=int, default=1000)
+    p.add_argument("--adam_beta2", type=float, default=0.99)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--grad_clip", type=float, default=1.0)
-    p.add_argument("--ema_decay", type=float, default=0.9999)
+    p.add_argument("--ema_decays", default="0.999,0.9999")
     p.add_argument("--bf16", type=int, default=1)
-    p.add_argument("--compile", type=int, default=0)
+    p.add_argument("--compile", type=int, default=1)
+    p.add_argument("--channels_last", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
     # bookkeeping
     p.add_argument("--log_every", type=int, default=100)
@@ -82,6 +98,14 @@ def parse_args(argv=None):
 
 def _ints(s):
     return [int(v) for v in str(s).split(",") if v.strip()]
+
+
+def _floats(s):
+    return [float(v) for v in str(s).split(",") if v.strip()]
+
+
+def snapshot_name(decay: float, step: int) -> str:
+    return f"ema{decay:g}_{step:07d}.pt"
 
 
 @torch.no_grad()
@@ -99,6 +123,8 @@ def save_preview(ema_model, diffusion, codec, shape, device, path, bf16):
 
 
 def main(argv=None) -> int:
+    global _STOP
+    _STOP = False
     args = parse_args(argv)
     signal.signal(signal.SIGUSR1, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
@@ -120,19 +146,26 @@ def main(argv=None) -> int:
     print(f"{len(bank)} volumes {bank.shape}, values {bank.values}, encoding {codec.encoding}, "
           f"phase fractions {np.round(bank.phase_fractions(), 4).tolist()}", flush=True)
 
+    nrb = _ints(args.num_res_blocks)
     model_config = dict(in_channels=codec.channels, out_channels=codec.channels, image_size=bank.shape[0],
                         base_channels=args.base_channels, channel_mult=_ints(args.channel_mult),
-                        num_res_blocks=args.num_res_blocks,
+                        num_res_blocks=nrb[0] if len(nrb) == 1 else nrb,
                         attention_resolutions=_ints(args.attention_resolutions),
-                        dropout=args.dropout, head_channels=args.head_channels)
-    diffusion_config = dict(T=args.T, schedule=args.schedule, var_type=args.var_type, clip_x0=True)
+                        dropout=args.dropout, head_channels=args.head_channels,
+                        self_condition=bool(args.self_condition))
+    diffusion_config = dict(T=args.T, schedule=args.schedule, snr_scale=args.snr_scale,
+                            zero_terminal_snr=bool(args.zero_terminal_snr), prediction=args.prediction,
+                            var_type=args.var_type, clip_x0=True, self_condition=bool(args.self_condition))
     data_meta = dict(values=bank.values, encoding=codec.encoding, shape=list(bank.shape),
                      data_dir=os.path.abspath(args.data_dir), n_volumes=len(bank))
 
     model = build_model(model_config).to(device)
+    mf = torch.channels_last_3d if args.channels_last else torch.contiguous_format
+    model = model.to(memory_format=mf)
     diffusion = build_diffusion(diffusion_config)
-    ema = EMA(model, args.ema_decay)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    emas = [EMA(model, d) for d in _floats(args.ema_decays)]
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, args.adam_beta2),
+                            weight_decay=args.weight_decay)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"U-Net parameters: {n_params / 1e6:.2f} M", flush=True)
 
@@ -142,8 +175,8 @@ def main(argv=None) -> int:
     if os.path.exists(last_path):
         ck = torch.load(last_path, map_location="cpu", weights_only=False)
         model.load_state_dict(ck["model"])
-        ema.load_state_dict(ck["ema"])
-        ema.model.to(device)
+        for e, sd in zip(emas, ck["emas"]):
+            e.load_state_dict(sd)
         opt.load_state_dict(ck["opt"])
         step = ck["step"]
         gen.set_state(ck["data_rng"])
@@ -156,22 +189,28 @@ def main(argv=None) -> int:
             json.dump({"args": vars(args), "model_config": model_config, "diffusion_config": diffusion_config,
                        "data": data_meta, "n_params": n_params}, fh, indent=2)
 
-    fwd = torch.compile(model) if args.compile else model
+    fwd = model
+    if args.compile and device.type == "cuda":
+        try:
+            fwd = torch.compile(model)
+        except Exception as exc:  # pragma: no cover - depends on the cluster toolchain
+            print(f"torch.compile unavailable ({exc}); using eager mode", flush=True)
 
     def state():
-        return {"model": model.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(), "step": step,
-                "data_rng": gen.get_state(), "torch_rng": torch.get_rng_state(),
+        return {"model": model.state_dict(), "emas": [e.state_dict() for e in emas], "opt": opt.state_dict(),
+                "step": step, "data_rng": gen.get_state(), "torch_rng": torch.get_rng_state(),
                 "cuda_rng": torch.cuda.get_rng_state() if device.type == "cuda" else None,
                 "model_config": model_config, "diffusion_config": diffusion_config, "data": data_meta,
                 "args": vars(args)}
 
     def snapshot():
-        path = os.path.join(args.out_dir, "snapshots", f"ema_{step:07d}.pt")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        atomic_save({"ema": ema.model.state_dict(), "step": step, "model_config": model_config,
-                     "diffusion_config": diffusion_config, "data": data_meta}, path)
+        os.makedirs(os.path.join(args.out_dir, "snapshots"), exist_ok=True)
+        for e in emas:
+            atomic_save({"ema": e.model.state_dict(), "ema_decay": e.decay, "step": step,
+                         "model_config": model_config, "diffusion_config": diffusion_config, "data": data_meta},
+                        os.path.join(args.out_dir, "snapshots", snapshot_name(e.decay, step)))
         if args.preview:
-            save_preview(ema.model, diffusion, codec, bank.shape, device,
+            save_preview(emas[-1].model, diffusion, codec, bank.shape, device,
                          os.path.join(args.out_dir, "previews", f"step_{step:07d}.png"), args.bf16)
 
     log_path = os.path.join(args.out_dir, "train_log.csv")
@@ -188,13 +227,22 @@ def main(argv=None) -> int:
         for g_ in opt.param_groups:
             g_["lr"] = lr
         x0 = bank.sample_batch(args.batch_size, gen, flips=bool(args.flips), permute_axes=bool(args.permute_axes))
-        with autocast(device, bool(args.bf16)):
-            loss = diffusion.training_loss(fwd, x0, generator=gen)
+        x0 = x0.contiguous(memory_format=mf)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        try:
+            with autocast(device, bool(args.bf16)):
+                loss = diffusion.training_loss(fwd, x0, generator=gen)
+            loss.backward()
+        except Exception as exc:  # compile errors surface on the first forward or backward
+            if fwd is model:
+                raise
+            print(f"compiled model failed ({type(exc).__name__}: {exc}); falling back to eager mode", flush=True)
+            fwd = model
+            continue
         gn = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         opt.step()
-        ema.update(model)
+        for e in emas:
+            e.update(model)
         step += 1
 
         loss_acc += loss.item()

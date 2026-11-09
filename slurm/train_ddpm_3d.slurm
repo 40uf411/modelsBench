@@ -17,6 +17,8 @@
 #   2. select the best EMA snapshot (ddpm3d.select)
 #   3. generate 150 samples with the full 1,000-step DDPM chain
 #   4. generate 150 samples with DDIM for every value in DDIM_STEPS
+#   5. generate 150 samples with DPM-Solver++(2M) for every value in DPMPP_STEPS
+#      (set DPMPP_STEPS="" to skip)
 #
 # Submit from the repository root:
 #   sbatch slurm/train_ddpm_3d.slurm                     # all datasets, one after the other
@@ -41,7 +43,9 @@ OUT_ROOT="${OUT_ROOT:-$GLOBALSCRATCH/modelsbench/ddpm_3d}"
 VENV="${VENV:-$HOME/venvs/modelsbench}"
 N_SAMPLES="${N_SAMPLES:-150}"
 DDIM_STEPS="${DDIM_STEPS:-50 100}"
-TRAIN_ARGS="${TRAIN_ARGS:---iters 150000 --batch_size 8}"   # see python -m ddpm3d.train -h
+DPMPP_STEPS="${DPMPP_STEPS-20}"
+TRAIN_ARGS="${TRAIN_ARGS:---iters 100000}"          # all other defaults: python -m ddpm3d.train -h
+SELECT_MIN_STEP="${SELECT_MIN_STEP:-30000}"        # ignore snapshots before this step
 
 DATASETS=(
   boom_clay_bin
@@ -123,7 +127,7 @@ for ds in "${DATASETS[@]}"; do
   if [ "$st" -ne 0 ]; then echo "== $ds: training failed (exit $st)"; continue; fi
 
   echo "== $ds: snapshot selection ($(date))"
-  stage "$run_dir/SELECT_DONE" python -u -m ddpm3d.select --run_dir "$run_dir" \
+  stage "$run_dir/SELECT_DONE" python -u -m ddpm3d.select --run_dir "$run_dir" --min_step "$SELECT_MIN_STEP" \
     || { echo "== $ds: selection failed"; continue; }
   if [ "$REQUEUE" -eq 1 ]; then requeue_and_exit; fi
 
@@ -138,6 +142,14 @@ for ds in "${DATASETS[@]}"; do
     stage "$run_dir/SAMPLES_DDIM${k}_DONE" python -u -m ddpm3d.sample --ckpt "$run_dir/best.pt" \
         --out_dir "$run_dir/samples/ddim$k" --sampler ddim --steps "$k" --n "$N_SAMPLES" \
       || echo "== $ds: DDIM-$k sampling failed"
+    if [ "$REQUEUE" -eq 1 ]; then requeue_and_exit; fi
+  done
+
+  for k in $DPMPP_STEPS; do
+    echo "== $ds: DPM-Solver++-$k sampling, $N_SAMPLES samples ($(date))"
+    stage "$run_dir/SAMPLES_DPMPP${k}_DONE" python -u -m ddpm3d.sample --ckpt "$run_dir/best.pt" \
+        --out_dir "$run_dir/samples/dpmpp$k" --sampler dpmpp --steps "$k" --n "$N_SAMPLES" \
+      || echo "== $ds: DPM-Solver++-$k sampling failed"
     if [ "$REQUEUE" -eq 1 ]; then requeue_and_exit; fi
   done
 done
