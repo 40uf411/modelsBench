@@ -57,13 +57,15 @@ DATASETS=(
 )
 if [ "$#" -gt 0 ]; then DATASETS=("$@"); fi
 
-module purge
+module --force purge 2>/dev/null || module purge
 module load releases/2024a
 module load Python/3.12.3-GCCcore-13.3.0
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
 
 REPO_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
+# accept submission from the repo root or from slurm/
+if [ ! -d "$REPO_DIR/slurm" ] && [ -d "$REPO_DIR/../slurm" ]; then REPO_DIR="$(cd "$REPO_DIR/.." && pwd)"; fi
 cd "$REPO_DIR" || exit 1
 mkdir -p "$OUT_ROOT"
 
